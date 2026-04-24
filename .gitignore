@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+tracking_system.db
+.venv/
+venv/
+.DS_Store
