@@ -6,6 +6,10 @@ import uvicorn
 import asyncio
 import os
 import json
+from pydantic import BaseModel, ConfigDict
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from typing import Optional
 
 app = FastAPI(title="Shipping Tracking API with Auto-Update")
 
@@ -20,6 +24,25 @@ app.add_middleware(
 
 scraper = CekResiScraper()
 db = DatabaseManager()
+
+# Password hashing setup
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+# Pydantic models for request/response
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    username: str
+    created_at: datetime
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
 # --- BACKGROUND WORKER ---
 async def auto_update_worker():
@@ -102,6 +125,56 @@ async def track_direct(resi: str = Query(...), courier: str = Query(None)):
     Original manual track endpoint (bypass database).
     """
     return await scraper.track(resi, courier)
+
+# --- USER ENDPOINTS ---
+
+@app.post("/auth/register")
+async def register_user(user: UserCreate):
+    """
+    Daftarkan user baru.
+    """
+    # Cek apakah user sudah ada
+    existing_user = db.get_user_by_username(user.username)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username sudah terdaftar")
+    
+    # Hash password
+    hashed_pwd = pwd_context.hash(user.password)
+    
+    try:
+        db.create_user(user.username, hashed_pwd)
+        return {"success": True, "message": "User berhasil didaftarkan"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    """
+    Login user dan kembalikan status sukses.
+    """
+    user = db.get_user_by_username(request.username)
+    if not user:
+        raise HTTPException(status_code=401, detail="Username atau password salah")
+    
+    # Verifikasi password
+    if not pwd_context.verify(request.password, user['password']):
+        raise HTTPException(status_code=401, detail="Username atau password salah")
+    
+    return {
+        "success": True, 
+        "message": "Login berhasil",
+        "user": {
+            "id": user['id'],
+            "username": user['username']
+        }
+    }
+
+@app.get("/users")
+async def list_users():
+    """
+    List semua user (Hanya untuk keperluan debug/admin).
+    """
+    return db.get_all_users()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

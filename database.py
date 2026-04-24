@@ -39,7 +39,13 @@ class DatabaseManager:
                             history_json TEXT,
                             last_updated TIMESTAMP,
                             is_delivered BOOLEAN DEFAULT FALSE
-                        )
+                        );
+                        CREATE TABLE IF NOT EXISTS users (
+                            id SERIAL PRIMARY KEY,
+                            username TEXT UNIQUE NOT NULL,
+                            password TEXT NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
                     """)
                 conn.commit()
         else:
@@ -54,6 +60,14 @@ class DatabaseManager:
                         history_json TEXT,
                         last_updated DATETIME,
                         is_delivered INTEGER DEFAULT 0
+                    )
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE NOT NULL,
+                        password TEXT NOT NULL,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
                 conn.commit()
@@ -147,4 +161,46 @@ class DatabaseManager:
         else:
             with self.get_connection() as conn:
                 cursor = conn.execute("SELECT * FROM trackings")
+                return [dict(row) for row in cursor.fetchall()]
+
+    # --- USER METHODS ---
+    def create_user(self, username, hashed_password):
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO users (username, password)
+                        VALUES (%s, %s)
+                    """, (username, hashed_password))
+                conn.commit()
+        else:
+            with self.get_connection() as conn:
+                conn.execute("""
+                    INSERT INTO users (username, password)
+                    VALUES (?, ?)
+                """, (username, hashed_password))
+                conn.commit()
+
+    def get_user_by_username(self, username):
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+        else:
+            with self.get_connection() as conn:
+                cursor = conn.execute("SELECT * FROM users WHERE username = ?", (username,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+
+    def get_all_users(self):
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT id, username, created_at FROM users")
+                    return [dict(row) for row in cur.fetchall()]
+        else:
+            with self.get_connection() as conn:
+                cursor = conn.execute("SELECT id, username, created_at FROM users")
                 return [dict(row) for row in cursor.fetchall()]
