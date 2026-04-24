@@ -18,7 +18,7 @@ RUN playwright install chromium
 COPY . .
 
 # Expose port (FastAPI default is 8000, hosting will provide PORT env)
-EXPOSE 8000
+EXPOSE 7860
 
 # Command to run the application
-CMD ["python", "api.py"]
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "7860"]
