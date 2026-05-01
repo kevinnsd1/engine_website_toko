@@ -206,25 +206,29 @@ async def list_all():
 
 @app.get("/track-direct")
 async def track_direct(
+    background_tasks: BackgroundTasks,
     resi: str = Query(...),
     courier: str = Query(None),
-    item_code: str = Query(None)   # opsional — jika ada, simpan hasil ke DB
+    item_code: str = Query(None)
 ):
     """
-    Scrape status resi secara langsung (bypass cache DB).
-    Jika item_code disertakan, hasil scrape otomatis disimpan/update ke database.
+    Scrape status resi secara langsung.
+    Jika item_code disertakan, hasil disimpan ke DB di background (tidak memblokir response).
     """
     result = await scraper.track(resi, courier)
 
+    # Simpan ke DB di background — response langsung dikembalikan
     if item_code and result.get("success"):
-        try:
-            status      = result["status"]
-            history     = result["history"]
-            is_delivered = "delivered" in status.lower() or "diterima" in status.lower()
-            db.update_tracking_status(item_code, status, history, is_delivered)
-            print(f"[track-direct] {item_code} disimpan ke DB: {status}")
-        except Exception as e:
-            print(f"[track-direct] Gagal simpan ke DB: {e}")
+        def save_to_db():
+            try:
+                status       = result["status"]
+                history      = result["history"]
+                is_delivered = "delivered" in status.lower() or "diterima" in status.lower()
+                db.update_tracking_status(item_code, status, history, is_delivered)
+                print(f"[track-direct BG] {item_code} tersimpan: {status}")
+            except Exception as e:
+                print(f"[track-direct BG] Gagal simpan DB: {e}")
+        background_tasks.add_task(save_to_db)
 
     return result
 
