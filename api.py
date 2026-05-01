@@ -213,22 +213,21 @@ async def track_direct(
 ):
     """
     Scrape status resi secara langsung.
-    Jika item_code disertakan, hasil disimpan ke DB di background (tidak memblokir response).
+    Jika item_code disertakan, hasil LANGSUNG disimpan ke DB (synchronous)
+    agar status tidak hilang saat halaman di-refresh.
     """
     result = await scraper.track(resi, courier)
 
-    # Simpan ke DB di background — response langsung dikembalikan
+    # DB write SYNCHRONOUS — pastikan DB sudah terupdate sebelum response dikembalikan
     if item_code and result.get("success"):
-        def save_to_db():
-            try:
-                status       = result["status"]
-                history      = result["history"]
-                is_delivered = "delivered" in status.lower() or "diterima" in status.lower()
-                db.update_tracking_status(item_code, status, history, is_delivered)
-                print(f"[track-direct BG] {item_code} tersimpan: {status}")
-            except Exception as e:
-                print(f"[track-direct BG] Gagal simpan DB: {e}")
-        background_tasks.add_task(save_to_db)
+        try:
+            status       = result["status"]
+            history      = result["history"]
+            is_delivered = "delivered" in status.lower() or "diterima" in status.lower()
+            db.update_tracking_status(item_code, status, history, is_delivered)
+            print(f"[track-direct] {item_code} disimpan ke DB: {status}")
+        except Exception as e:
+            print(f"[track-direct] Gagal simpan DB: {e}")
 
     return result
 
