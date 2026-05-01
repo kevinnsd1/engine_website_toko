@@ -205,16 +205,53 @@ async def list_all():
     return db.get_all_trackings()
 
 @app.get("/track-direct")
-async def track_direct(resi: str = Query(...), courier: str = Query(None)):
+async def track_direct(
+    resi: str = Query(...),
+    courier: str = Query(None),
+    item_code: str = Query(None)   # opsional — jika ada, simpan hasil ke DB
+):
     """
-    Original manual track endpoint (bypass database).
+    Scrape status resi secara langsung (bypass cache DB).
+    Jika item_code disertakan, hasil scrape otomatis disimpan/update ke database.
     """
-    return await scraper.track(resi, courier)
+    result = await scraper.track(resi, courier)
+
+    if item_code and result.get("success"):
+        try:
+            status      = result["status"]
+            history     = result["history"]
+            is_delivered = "delivered" in status.lower() or "diterima" in status.lower()
+            db.update_tracking_status(item_code, status, history, is_delivered)
+            print(f"[track-direct] {item_code} disimpan ke DB: {status}")
+        except Exception as e:
+            print(f"[track-direct] Gagal simpan ke DB: {e}")
+
+    return result
 
 @app.get("/returns")
 async def list_returns():
-    """Ambil semua data retur (otomatis dari worker + hasil deteksi)."""
+    """Ambil semua data retur."""
     return db.get_returns()
+
+class ReturnCreate(BaseModel):
+    sku_code: str
+    product_name: Optional[str] = None
+    reason: Optional[str] = None
+    status: Optional[str] = "PENDING"
+
+@app.post("/returns")
+async def create_return(data: ReturnCreate):
+    """
+    Simpan data retur baru.
+    Jika sku_code sudah ada (duplikat), tidak insert ulang.
+    """
+    if db.return_exists(data.sku_code):
+        return {"success": False, "message": f"Retur untuk {data.sku_code} sudah ada"}
+    try:
+        db.add_return(data.sku_code, data.product_name, data.reason, data.status or "PENDING")
+        return {"success": True, "message": f"Retur {data.sku_code} berhasil dicatat"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # --- USER ENDPOINTS ---
 
