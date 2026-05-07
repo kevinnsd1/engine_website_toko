@@ -1,156 +1,127 @@
 import asyncio
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-from scrapers.base_scraper import BaseScraper
+import requests
+import re
 from bs4 import BeautifulSoup
+from scrapers.base_scraper import BaseScraper
 
 class CekResiScraper(BaseScraper):
     def __init__(self):
-        self.url = "https://cekresi.com/"
+        self.base_url = "https://www.cekpengiriman.com"
+        # We use a session to maintain cookies/headers if needed
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
 
     def _detect_courier(self, resi: str) -> str:
-        resi = resi.strip()
-        if resi.startswith(('JX', 'JP')):        return "J&T Express"
-        if resi.startswith(('JT',)) or (resi.startswith(('3', '8')) and len(resi) >= 11): return "J&T Cargo"
-        if resi.startswith(('TJ', '01', '88', 'JNA')): return "JNE"
-        if resi.startswith(('00', 'SG', 'P')):   return "SICEPAT"
-        if resi.upper().startswith('SPX'):        return "SPX Express"
-        if resi.startswith(('SHP', 'NL', 'NV')): return "Ninja Xpress"
-        if resi.startswith('LP'):                 return "Lion Parcel"
-        if resi.startswith('P2'):                 return "Pos Indonesia"
+        resi = resi.strip().upper()
+        if resi.startswith(('JX', 'JP')):        return "jnt"
+        if resi.startswith(('JT',)) or (resi.startswith(('3', '8')) and len(resi) >= 11): return "jtcargo"
+        if resi.startswith(('TJ', '01', '88', 'JNA')): return "jne"
+        if resi.startswith(('00', 'SG', 'P')):   return "sicepat"
+        if resi.startswith('SPX'):               return "spx"
+        if resi.startswith(('SHP', 'NL', 'NV')): return "ninja"
+        if resi.startswith('LP'):                return "lion"
+        if resi.startswith('P2'):                return "pos"
         return ""
 
-    async def handle_ads(self, page):
-        """Tutup iklan/popup dengan cepat, tidak block lama."""
+    def _fetch_sync(self, resi: str, courier: str) -> dict:
         try:
-            for selector in ['#dismiss-button', '.dismiss-button', '#close-button', '[aria-label="Close"]']:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.count() > 0 and await btn.is_visible():
-                        await btn.click(timeout=1000)
-                except:
-                    pass
-            # Cek frame iklan
-            for frame in page.frames:
-                for selector in ['#dismiss-button', '.dismiss-button']:
-                    try:
-                        btn = await frame.query_selector(selector)
-                        if btn and await btn.is_visible():
-                            await btn.click()
-                    except:
-                        pass
-        except:
-            pass
+            url = f"{self.base_url}/cek-resi?resi={resi}&kurir={courier}"
+            res = self.session.get(url, timeout=10)
+            res.raise_for_status()
+            
+            # Extract token
+            match = re.search(r'\"token\",\s*\"([a-f0-9]+)\"', res.text)
+            if not match:
+                return self.error_response("Token keamanan tidak ditemukan di cekpengiriman.com")
+            
+            token = match.group(1)
+            api_url = f"{self.base_url}/wp-content/themes/simple/includes/widget/resultResi.php"
+            files = {
+                'token': (None, token),
+                'resi': (None, resi),
+                'kurir': (None, courier)
+            }
+            headers = {
+                'Origin': self.base_url,
+                'Referer': url,
+                'X-Requested-With': 'XMLHttpRequest'
+            }
+            
+            api_res = self.session.post(api_url, files=files, headers=headers, timeout=10)
+            api_res.raise_for_status()
+            html_result = api_res.text
+            
+            if "Kode resi tidak ditemukan" in html_result or "tidak terdaftar" in html_result.lower():
+                return self.error_response("Resi tidak ditemukan atau belum terdaftar")
+                
+            soup = BeautifulSoup(html_result, 'html.parser')
+            
+            # Parse Status
+            status = "Unknown"
+            status_td = soup.find('td', string=re.compile(r'Status', re.I))
+            if status_td:
+                next_td = status_td.find_next_sibling('td')
+                if next_td:
+                    status = next_td.get_text(strip=True)
+                    
+            # Parse History
+            history = []
+            riwayat_header = soup.find('h4', string=re.compile(r'Riwayat Pengiriman', re.I))
+            if riwayat_header:
+                table = riwayat_header.find_next_sibling('table')
+                if table:
+                    for tr in table.find_all('tr'):
+                        td = tr.find('td')
+                        if td:
+                            text = td.get_text(strip=True)
+                            parts = text.split(' - ', 1)
+                            if len(parts) == 2:
+                                date_str, desc = parts
+                                history.append({
+                                    "date": date_str.strip(),
+                                    "description": desc.strip()
+                                })
+                            else:
+                                history.append({
+                                    "date": "",
+                                    "description": text
+                                })
+            
+            if not history and status == "Unknown":
+                return self.error_response("Gagal membaca hasil pelacakan dari cekpengiriman")
+                
+            return self.format_response(status, history)
+            
+        except requests.RequestException as e:
+            return self.error_response(f"Terjadi kesalahan jaringan: {str(e)}")
+        except Exception as e:
+            return self.error_response(f"Kesalahan internal: {str(e)}")
 
     async def track(self, resi: str, courier: str = None) -> dict:
         resi = resi.strip()
-        target_courier = courier or self._detect_courier(resi)
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=[
-                '--no-sandbox', '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-            ])
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={'width': 1366, 'height': 768}
-            )
-            page = await context.new_page()
-
-            try:
-                # 1. Buka halaman
-                await page.goto(self.url, wait_until="domcontentloaded", timeout=30000)
-
-                # 2. Isi nomor resi
-                await page.wait_for_selector('#noresi', timeout=10000)
-                await page.fill('#noresi', resi)
-
-                # 3. Klik cek
-                await page.click('#cekresi')
-                await asyncio.sleep(1)
-                await self.handle_ads(page)
-
-                # 4. Pilih kurir
-                try:
-                    await page.wait_for_selector('a.btn', timeout=10000)
-                    if target_courier:
-                        btn = page.locator(f'a.btn:has-text("{target_courier}")').first
-                        if await btn.count() > 0:
-                            await btn.click()
-                        else:
-                            await page.locator('a.btn').first.click()
-                    else:
-                        await page.locator('a.btn').first.click()
-                except:
-                    pass
-
-                await asyncio.sleep(1)
-                await self.handle_ads(page)
-
-                # 5. Tunggu hasil — coba beberapa selector
-                result_found = False
-                for selector in ['.alert-success', '.tracking-result', 'table.table', '#hasil']:
-                    try:
-                        await page.wait_for_selector(selector, timeout=20000)
-                        result_found = True
-                        break
-                    except PlaywrightTimeout:
-                        continue
-
-                if not result_found:
-                    # Fallback: tunggu network idle dan coba baca apapun yang ada
-                    try:
-                        await page.wait_for_load_state('networkidle', timeout=10000)
-                    except:
-                        pass
-
-                # 6. Expand history jika ada
-                try:
-                    expand_btn = page.get_by_text("Lihat perjalanan paket").first
-                    if await expand_btn.count() > 0:
-                        await expand_btn.click()
-                        await asyncio.sleep(1)
-                except:
-                    pass
-
-                # 7. Parse hasil
-                content = await page.content()
-                soup = BeautifulSoup(content, 'html.parser')
-
-                # Parse history dari tabel
-                history = []
-                for table in soup.find_all('table'):
-                    text = table.get_text().lower()
-                    if "tanggal" in text and "keterangan" in text:
-                        for row in table.find_all('tr'):
-                            cols = row.find_all('td')
-                            if len(cols) >= 2:
-                                date = cols[0].get_text(strip=True)
-                                desc = cols[1].get_text(strip=True)
-                                if "tanggal" in date.lower():
-                                    continue
-                                if date and desc:
-                                    history.append({"date": date, "description": desc})
-                        if history:
-                            break
-
-                # Parse status
-                status = "Unknown"
-                status_box = soup.select_one('.alert-success')
-                if status_box:
-                    status = status_box.get_text(strip=True)
-                elif history:
-                    status = history[0]['description']
-
-                await browser.close()
-
-                if not history and status == "Unknown":
-                    return self.error_response("Tidak ada data tracking ditemukan")
-
-                return self.format_response(status, history)
-
-            except Exception as e:
-                try:
-                    await browser.close()
-                except:
-                    pass
-                return self.error_response(str(e))
+        
+        # Convert internal courier name to cekpengiriman code if possible
+        target_courier = ""
+        if courier:
+            # simple mapping just in case
+            c_lower = courier.lower()
+            if "j&t" in c_lower and "cargo" not in c_lower: target_courier = "jnt"
+            elif "j&t cargo" in c_lower: target_courier = "jtcargo"
+            elif "jne" in c_lower: target_courier = "jne"
+            elif "sicepat" in c_lower: target_courier = "sicepat"
+            elif "shopee" in c_lower or "spx" in c_lower: target_courier = "spx"
+            elif "ninja" in c_lower: target_courier = "ninja"
+            elif "lion" in c_lower: target_courier = "lion"
+            elif "pos" in c_lower: target_courier = "pos"
+        
+        if not target_courier:
+            target_courier = self._detect_courier(resi)
+            
+        if not target_courier:
+            return self.error_response("Kurir tidak terdeteksi")
+            
+        # Run synchronous requests code in a separate thread so it doesn't block the async event loop
+        return await asyncio.to_thread(self._fetch_sync, resi, target_courier)
