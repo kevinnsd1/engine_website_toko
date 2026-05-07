@@ -38,7 +38,8 @@ class DatabaseManager:
                             history_json TEXT,
                             last_updated TIMESTAMP,
                             is_delivered BOOLEAN DEFAULT FALSE,
-                            user_id INTEGER
+                            user_id INTEGER,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                         CREATE TABLE IF NOT EXISTS users (
                             id SERIAL PRIMARY KEY,
@@ -193,8 +194,11 @@ class DatabaseManager:
                     )
                 """)
                 # Migrasi kolom untuk DB lama
-                for col_def in ["ALTER TABLE trackings ADD COLUMN destination TEXT",
-                                "ALTER TABLE trackings ADD COLUMN user_id INTEGER"]:
+                for col_def in [
+                    "ALTER TABLE trackings ADD COLUMN destination TEXT",
+                    "ALTER TABLE trackings ADD COLUMN user_id INTEGER",
+                    "ALTER TABLE trackings ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+                ]:
                     try:
                         conn.execute(col_def)
                     except Exception:
