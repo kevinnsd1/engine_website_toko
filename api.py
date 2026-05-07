@@ -139,6 +139,13 @@ async def auto_update_worker():
                         or "gagal" in latest_desc or "failed" in latest_desc
                         or "rejected" in latest_desc
                     )
+                    is_cancelled = (
+                        "cancel" in latest_desc or "batal" in latest_desc
+                        or "dibatalkan" in latest_desc or "cancellation" in latest_desc
+                        or "void" in latest_desc or "canceled" in latest_desc
+                        or "cancel" in status.lower() or "batal" in status.lower()
+                        or "dibatalkan" in status.lower()
+                    )
 
                     if is_returned or is_failed:
                         reason_type = "Paket Diretur" if is_returned else "Gagal Pengiriman"
@@ -151,6 +158,26 @@ async def auto_update_worker():
                         if not db.return_exists(item_code):
                             db.add_return(item_code, item_code, reason, "PENDING")
                             print(f"[Worker] {item_code} -> {reason_type} dicatat ke tabel returns")
+
+                    # --- Deteksi otomatis pembatalan ---
+                    if is_cancelled:
+                        raw_desc = ""
+                        if history and len(history) > 0:
+                            h = history[0]
+                            raw_desc = h.get("description") or h.get("status") or ""
+                        reason = f"Pembatalan otomatis terdeteksi: {raw_desc}" if raw_desc else "Paket Dibatalkan (terdeteksi otomatis)"
+
+                        if not db.cancellation_exists(item_code, user_id=user_id):
+                            db.add_cancellation(
+                                item_code=item_code,
+                                resi_number=resi,
+                                courier=courier,
+                                reason=reason,
+                                user_id=user_id,
+                            )
+                            # Hapus dari tracking aktif karena sudah dibatalkan
+                            db.delete_tracking(item_code, user_id=user_id)
+                            print(f"[Worker] {item_code} -> Pembatalan dicatat & dihapus dari tracking aktif")
 
                 # Jeda acak antar barang (5 - 15 detik)
                 delay_between = random.randint(5, 15)
