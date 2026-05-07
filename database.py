@@ -332,15 +332,29 @@ class DatabaseManager:
 
     def get_trackings_by_user(self, user_id):
         """Ambil semua resi milik user tertentu."""
+        def _parse_rows(rows):
+            result = []
+            for r in rows:
+                data = dict(r)
+                if data.get('history_json'):
+                    try:
+                        data['history'] = json.loads(data['history_json'])
+                    except:
+                        data['history'] = []
+                else:
+                    data['history'] = []
+                result.append(data)
+            return result
+
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute("SELECT * FROM trackings WHERE user_id = %s ORDER BY last_updated DESC NULLS LAST", (user_id,))
-                    return [dict(row) for row in cur.fetchall()]
+                    return _parse_rows(cur.fetchall())
         else:
             with self.get_connection() as conn:
                 cursor = conn.execute("SELECT * FROM trackings WHERE user_id = ? ORDER BY last_updated DESC", (user_id,))
-                return [dict(row) for row in cursor.fetchall()]
+                return _parse_rows(cursor.fetchall())
 
     def get_tracking_by_item(self, item_code, user_id=None):
         if self.use_postgres:
