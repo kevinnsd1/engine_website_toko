@@ -16,11 +16,9 @@ class DatabaseManager:
 
     def get_connection(self):
         if self.use_postgres:
-            # Connect to Supabase/PostgreSQL
             conn = psycopg2.connect(self.db_url)
             return conn
         else:
-            # Fallback to local SQLite
             conn = sqlite3.connect("tracking_system.db")
             conn.row_factory = sqlite3.Row
             return conn
@@ -32,14 +30,15 @@ class DatabaseManager:
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS trackings (
                             id SERIAL PRIMARY KEY,
-                            item_code TEXT UNIQUE,
+                            item_code TEXT,
                             resi_number TEXT NOT NULL,
                             courier TEXT,
                             destination TEXT,
                             last_status TEXT,
                             history_json TEXT,
                             last_updated TIMESTAMP,
-                            is_delivered BOOLEAN DEFAULT FALSE
+                            is_delivered BOOLEAN DEFAULT FALSE,
+                            user_id INTEGER
                         );
                         CREATE TABLE IF NOT EXISTS users (
                             id SERIAL PRIMARY KEY,
@@ -82,11 +81,37 @@ class DatabaseManager:
                             physical_stock INTEGER,
                             discrepancy INTEGER
                         );
+                        CREATE TABLE IF NOT EXISTS cancellations (
+                            id SERIAL PRIMARY KEY,
+                            item_code TEXT NOT NULL,
+                            resi_number TEXT,
+                            courier TEXT,
+                            reason TEXT,
+                            user_id INTEGER,
+                            cancelled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
                     """)
-                    # Check if destination column exists in trackings, if not add it
+                    # Migrasi: tambah kolom baru jika belum ada di tabel lama
+                    for col, col_type in [("destination", "TEXT"), ("user_id", "INTEGER")]:
+                        try:
+                            cur.execute(f"ALTER TABLE trackings ADD COLUMN IF NOT EXISTS {col} {col_type}")
+                        except Exception:
+                            pass
+                    # Hapus UNIQUE constraint lama di item_code jika ada
+                    # (karena sekarang item_code bisa sama untuk user berbeda)
                     try:
-                        cur.execute("ALTER TABLE trackings ADD COLUMN IF NOT EXISTS destination TEXT")
-                    except:
+                        cur.execute("""
+                            DO $$
+                            BEGIN
+                                IF EXISTS (
+                                    SELECT 1 FROM pg_constraint
+                                    WHERE conname = 'trackings_item_code_key'
+                                ) THEN
+                                    ALTER TABLE trackings DROP CONSTRAINT trackings_item_code_key;
+                                END IF;
+                            END $$;
+                        """)
+                    except Exception:
                         pass
                 conn.commit()
         else:
@@ -94,14 +119,15 @@ class DatabaseManager:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS trackings (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        item_code TEXT UNIQUE,
+                        item_code TEXT,
                         resi_number TEXT NOT NULL,
                         courier TEXT,
                         destination TEXT,
                         last_status TEXT,
                         history_json TEXT,
                         last_updated DATETIME,
-                        is_delivered INTEGER DEFAULT 0
+                        is_delivered INTEGER DEFAULT 0,
+                        user_id INTEGER
                     )
                 """)
                 conn.execute("""
@@ -155,76 +181,141 @@ class DatabaseManager:
                         discrepancy INTEGER
                     )
                 """)
-                # SQLite doesn't support ADD COLUMN IF NOT EXISTS easily in old versions, 
-                # but since we added it to CREATE TABLE above for new DBs, 
-                # we just try to alter for existing ones.
-                try:
-                    conn.execute("ALTER TABLE trackings ADD COLUMN destination TEXT")
-                except:
-                    pass
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS cancellations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        item_code TEXT NOT NULL,
+                        resi_number TEXT,
+                        courier TEXT,
+                        reason TEXT,
+                        user_id INTEGER,
+                        cancelled_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                # Migrasi kolom untuk DB lama
+                for col_def in ["ALTER TABLE trackings ADD COLUMN destination TEXT",
+                                "ALTER TABLE trackings ADD COLUMN user_id INTEGER"]:
+                    try:
+                        conn.execute(col_def)
+                    except Exception:
+                        pass
                 conn.commit()
 
-    def add_or_update_tracking(self, item_code, resi_number, courier=None, destination=None):
+    # ─── TRACKING METHODS ────────────────────────────────────────────────────────
+
+    def add_or_update_tracking(self, item_code, resi_number, courier=None, destination=None, user_id=None):
         now = datetime.now().isoformat()
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO trackings (item_code, resi_number, courier, destination, last_updated)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT(item_code) DO UPDATE SET
-                            resi_number = EXCLUDED.resi_number,
-                            courier = EXCLUDED.courier,
-                            destination = EXCLUDED.destination,
-                            last_updated = EXCLUDED.last_updated
-                    """, (item_code, resi_number, courier, destination, now))
+                    # Cek apakah sudah ada record untuk user + item_code yang sama
+                    if user_id:
+                        cur.execute(
+                            "SELECT id FROM trackings WHERE item_code = %s AND user_id = %s",
+                            (item_code, user_id)
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT id FROM trackings WHERE item_code = %s AND user_id IS NULL",
+                            (item_code,)
+                        )
+                    existing = cur.fetchone()
+
+                    if existing:
+                        cur.execute("""
+                            UPDATE trackings SET
+                                resi_number = %s, courier = %s,
+                                destination = %s, last_updated = %s
+                            WHERE id = %s
+                        """, (resi_number, courier, destination, now, existing[0]))
+                    else:
+                        cur.execute("""
+                            INSERT INTO trackings (item_code, resi_number, courier, destination, last_updated, user_id)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, (item_code, resi_number, courier, destination, now, user_id))
                 conn.commit()
         else:
             with self.get_connection() as conn:
-                conn.execute("""
-                    INSERT INTO trackings (item_code, resi_number, courier, destination, last_updated)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(item_code) DO UPDATE SET
-                        resi_number = excluded.resi_number,
-                        courier = excluded.courier,
-                        destination = excluded.destination,
-                        last_updated = excluded.last_updated
-                """, (item_code, resi_number, courier, destination, now))
+                if user_id:
+                    cursor = conn.execute(
+                        "SELECT id FROM trackings WHERE item_code = ? AND user_id = ?",
+                        (item_code, user_id)
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT id FROM trackings WHERE item_code = ? AND user_id IS NULL",
+                        (item_code,)
+                    )
+                existing = cursor.fetchone()
+
+                if existing:
+                    conn.execute("""
+                        UPDATE trackings SET
+                            resi_number = ?, courier = ?,
+                            destination = ?, last_updated = ?
+                        WHERE id = ?
+                    """, (resi_number, courier, destination, now, existing[0]))
+                else:
+                    conn.execute("""
+                        INSERT INTO trackings (item_code, resi_number, courier, destination, last_updated, user_id)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (item_code, resi_number, courier, destination, now, user_id))
                 conn.commit()
 
-    def delete_tracking(self, item_code):
+    def delete_tracking(self, item_code, user_id=None):
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("DELETE FROM trackings WHERE item_code = %s", (item_code,))
+                    if user_id:
+                        cur.execute("DELETE FROM trackings WHERE item_code = %s AND user_id = %s", (item_code, user_id))
+                    else:
+                        cur.execute("DELETE FROM trackings WHERE item_code = %s", (item_code,))
                 conn.commit()
         else:
             with self.get_connection() as conn:
-                conn.execute("DELETE FROM trackings WHERE item_code = ?", (item_code,))
+                if user_id:
+                    conn.execute("DELETE FROM trackings WHERE item_code = ? AND user_id = ?", (item_code, user_id))
+                else:
+                    conn.execute("DELETE FROM trackings WHERE item_code = ?", (item_code,))
                 conn.commit()
 
-    def update_tracking_status(self, item_code, status, history, is_delivered):
+    def update_tracking_status(self, item_code, status, history, is_delivered, user_id=None):
         now = datetime.now().isoformat()
         history_str = json.dumps(history)
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE trackings 
-                        SET last_status = %s, history_json = %s, is_delivered = %s, last_updated = %s
-                        WHERE item_code = %s
-                    """, (status, history_str, is_delivered, now, item_code))
+                    if user_id:
+                        cur.execute("""
+                            UPDATE trackings 
+                            SET last_status = %s, history_json = %s, is_delivered = %s, last_updated = %s
+                            WHERE item_code = %s AND user_id = %s
+                        """, (status, history_str, is_delivered, now, item_code, user_id))
+                    else:
+                        cur.execute("""
+                            UPDATE trackings 
+                            SET last_status = %s, history_json = %s, is_delivered = %s, last_updated = %s
+                            WHERE item_code = %s
+                        """, (status, history_str, is_delivered, now, item_code))
                 conn.commit()
         else:
             with self.get_connection() as conn:
-                conn.execute("""
-                    UPDATE trackings 
-                    SET last_status = ?, history_json = ?, is_delivered = ?, last_updated = ?
-                    WHERE item_code = ?
-                """, (status, history_str, 1 if is_delivered else 0, now, item_code))
+                if user_id:
+                    conn.execute("""
+                        UPDATE trackings 
+                        SET last_status = ?, history_json = ?, is_delivered = ?, last_updated = ?
+                        WHERE item_code = ? AND user_id = ?
+                    """, (status, history_str, 1 if is_delivered else 0, now, item_code, user_id))
+                else:
+                    conn.execute("""
+                        UPDATE trackings 
+                        SET last_status = ?, history_json = ?, is_delivered = ?, last_updated = ?
+                        WHERE item_code = ?
+                    """, (status, history_str, 1 if is_delivered else 0, now, item_code))
                 conn.commit()
 
     def get_all_active_trackings(self):
+        """Dipakai oleh background worker — ambil SEMUA resi aktif dari semua user."""
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -235,11 +326,26 @@ class DatabaseManager:
                 cursor = conn.execute("SELECT * FROM trackings WHERE is_delivered = 0")
                 return [dict(row) for row in cursor.fetchall()]
 
-    def get_tracking_by_item(self, item_code):
+    def get_trackings_by_user(self, user_id):
+        """Ambil semua resi milik user tertentu."""
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT * FROM trackings WHERE item_code = %s", (item_code,))
+                    cur.execute("SELECT * FROM trackings WHERE user_id = %s ORDER BY last_updated DESC NULLS LAST", (user_id,))
+                    return [dict(row) for row in cur.fetchall()]
+        else:
+            with self.get_connection() as conn:
+                cursor = conn.execute("SELECT * FROM trackings WHERE user_id = ? ORDER BY last_updated DESC", (user_id,))
+                return [dict(row) for row in cursor.fetchall()]
+
+    def get_tracking_by_item(self, item_code, user_id=None):
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if user_id:
+                        cur.execute("SELECT * FROM trackings WHERE item_code = %s AND user_id = %s", (item_code, user_id))
+                    else:
+                        cur.execute("SELECT * FROM trackings WHERE item_code = %s", (item_code,))
                     row = cur.fetchone()
                     if row:
                         data = dict(row)
@@ -248,7 +354,10 @@ class DatabaseManager:
                         return data
         else:
             with self.get_connection() as conn:
-                cursor = conn.execute("SELECT * FROM trackings WHERE item_code = ?", (item_code,))
+                if user_id:
+                    cursor = conn.execute("SELECT * FROM trackings WHERE item_code = ? AND user_id = ?", (item_code, user_id))
+                else:
+                    cursor = conn.execute("SELECT * FROM trackings WHERE item_code = ?", (item_code,))
                 row = cursor.fetchone()
                 if row:
                     data = dict(row)
@@ -258,6 +367,7 @@ class DatabaseManager:
         return None
 
     def get_all_trackings(self):
+        """Legacy — tidak dipakai oleh endpoint user biasa lagi."""
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -268,7 +378,8 @@ class DatabaseManager:
                 cursor = conn.execute("SELECT * FROM trackings")
                 return [dict(row) for row in cursor.fetchall()]
 
-    # --- USER METHODS ---
+    # ─── USER METHODS ────────────────────────────────────────────────────────────
+
     def create_user(self, username, hashed_password):
         if self.use_postgres:
             with self.get_connection() as conn:
@@ -299,6 +410,19 @@ class DatabaseManager:
                 row = cursor.fetchone()
                 return dict(row) if row else None
 
+    def get_user_by_id(self, user_id):
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+        else:
+            with self.get_connection() as conn:
+                cursor = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+
     def get_all_users(self):
         if self.use_postgres:
             with self.get_connection() as conn:
@@ -310,7 +434,8 @@ class DatabaseManager:
                 cursor = conn.execute("SELECT id, username, created_at FROM users")
                 return [dict(row) for row in cursor.fetchall()]
 
-    # --- PRODUCT METHODS ---
+    # ─── PRODUCT METHODS ─────────────────────────────────────────────────────────
+
     def get_products(self):
         if self.use_postgres:
             with self.get_connection() as conn:
@@ -353,7 +478,8 @@ class DatabaseManager:
                 """, (sku_code, name, category, stock, status, image_url))
                 conn.commit()
 
-    # --- RETURN METHODS ---
+    # ─── RETURN METHODS ──────────────────────────────────────────────────────────
+
     def get_returns(self):
         if self.use_postgres:
             with self.get_connection() as conn:
@@ -394,7 +520,64 @@ class DatabaseManager:
                 cursor = conn.execute("SELECT COUNT(*) FROM returns WHERE sku_code = ?", (sku_code,))
                 return cursor.fetchone()[0] > 0
 
-    # --- STOCK OPNAME METHODS ---
+    # ─── CANCELLATION METHODS ────────────────────────────────────────────────────
+
+    def add_cancellation(self, item_code, resi_number=None, courier=None, reason=None, user_id=None):
+        now = datetime.now().isoformat()
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO cancellations (item_code, resi_number, courier, reason, user_id, cancelled_at)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (item_code, resi_number, courier, reason, user_id, now))
+                conn.commit()
+        else:
+            with self.get_connection() as conn:
+                conn.execute("""
+                    INSERT INTO cancellations (item_code, resi_number, courier, reason, user_id, cancelled_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (item_code, resi_number, courier, reason, user_id, now))
+                conn.commit()
+
+    def get_cancellations(self, user_id=None):
+        """Ambil pembatalan. Jika user_id diberikan, filter per user."""
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    if user_id:
+                        cur.execute("SELECT * FROM cancellations WHERE user_id = %s ORDER BY cancelled_at DESC", (user_id,))
+                    else:
+                        cur.execute("SELECT * FROM cancellations ORDER BY cancelled_at DESC")
+                    return [dict(row) for row in cur.fetchall()]
+        else:
+            with self.get_connection() as conn:
+                if user_id:
+                    cursor = conn.execute("SELECT * FROM cancellations WHERE user_id = ? ORDER BY cancelled_at DESC", (user_id,))
+                else:
+                    cursor = conn.execute("SELECT * FROM cancellations ORDER BY cancelled_at DESC")
+                return [dict(row) for row in cursor.fetchall()]
+
+    def cancellation_exists(self, item_code, user_id=None):
+        if self.use_postgres:
+            with self.get_connection() as conn:
+                with conn.cursor() as cur:
+                    if user_id:
+                        cur.execute("SELECT COUNT(*) FROM cancellations WHERE item_code = %s AND user_id = %s", (item_code, user_id))
+                    else:
+                        cur.execute("SELECT COUNT(*) FROM cancellations WHERE item_code = %s", (item_code,))
+                    return cur.fetchone()[0] > 0
+        else:
+            with self.get_connection() as conn:
+                if user_id:
+                    cursor = conn.execute("SELECT COUNT(*) FROM cancellations WHERE item_code = ? AND user_id = ?", (item_code, user_id))
+                else:
+                    cursor = conn.execute("SELECT COUNT(*) FROM cancellations WHERE item_code = ?", (item_code,))
+                return cursor.fetchone()[0] > 0
+
+    # ─── STOCK OPNAME METHODS ────────────────────────────────────────────────────
+
+
     def get_stock_opnames(self):
         if self.use_postgres:
             with self.get_connection() as conn:
@@ -459,7 +642,8 @@ class DatabaseManager:
                 """, (total_items, discrepancies or 0, opname_id))
                 conn.commit()
 
-    # --- DASHBOARD SUMMARY ---
+    # ─── DASHBOARD SUMMARY ───────────────────────────────────────────────────────
+
     def get_dashboard_summary(self):
         summary = {
             "total_inventory": 0,
@@ -472,26 +656,26 @@ class DatabaseManager:
                 with conn.cursor() as cur:
                     cur.execute("SELECT SUM(stock) FROM products")
                     summary["total_inventory"] = cur.fetchone()[0] or 0
-                    
+
                     cur.execute("SELECT COUNT(*) FROM trackings WHERE is_delivered = FALSE")
                     summary["pending_shipments"] = cur.fetchone()[0] or 0
-                    
+
                     cur.execute("SELECT COUNT(*) FROM returns WHERE created_at > NOW() - INTERVAL '7 days'")
                     summary["recent_returns"] = cur.fetchone()[0] or 0
-                    
+
                     cur.execute("SELECT COUNT(*) FROM products WHERE stock < 15")
                     summary["stock_alerts"] = cur.fetchone()[0] or 0
         else:
             with self.get_connection() as conn:
                 cursor = conn.execute("SELECT SUM(stock) FROM products")
                 summary["total_inventory"] = cursor.fetchone()[0] or 0
-                
+
                 cursor = conn.execute("SELECT COUNT(*) FROM trackings WHERE is_delivered = 0")
                 summary["pending_shipments"] = cursor.fetchone()[0] or 0
-                
+
                 cursor = conn.execute("SELECT COUNT(*) FROM returns WHERE created_at > datetime('now', '-7 days')")
                 summary["recent_returns"] = cursor.fetchone()[0] or 0
-                
+
                 cursor = conn.execute("SELECT COUNT(*) FROM products WHERE stock < 15")
                 summary["stock_alerts"] = cursor.fetchone()[0] or 0
         return summary
