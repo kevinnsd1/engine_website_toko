@@ -11,7 +11,12 @@ load_dotenv()
 class DatabaseManager:
     def __init__(self):
         self.db_url = os.getenv("DATABASE_URL")
-        self.use_postgres = self.db_url is not None and self.db_url.startswith("postgresql")
+        # Support both postgres:// and postgresql://
+        self.use_postgres = self.db_url is not None and self.db_url.startswith("postgres")
+        if self.use_postgres:
+            print("Database: Using Remote Postgres (Supabase)")
+        else:
+            print("Database: Using Local SQLite (Temporary)")
         self.init_db()
 
     def get_connection(self):
@@ -62,8 +67,11 @@ class DatabaseManager:
                             id SERIAL PRIMARY KEY,
                             sku_code TEXT NOT NULL,
                             product_name TEXT,
+                            resi_number TEXT,
+                            courier TEXT,
                             status TEXT DEFAULT 'PENDING',
                             reason TEXT,
+                            user_id INTEGER,
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         );
                         CREATE TABLE IF NOT EXISTS stock_opnames (
@@ -96,6 +104,13 @@ class DatabaseManager:
                     for col, col_type in [("destination", "TEXT"), ("user_id", "INTEGER")]:
                         try:
                             cur.execute(f"ALTER TABLE trackings ADD COLUMN IF NOT EXISTS {col} {col_type}")
+                        except Exception:
+                            pass
+                    
+                    # Migrasi: tambah kolom baru jika belum ada di tabel returns
+                    for col, col_type in [("resi_number", "TEXT"), ("courier", "TEXT"), ("user_id", "INTEGER")]:
+                        try:
+                            cur.execute(f"ALTER TABLE returns ADD COLUMN IF NOT EXISTS {col} {col_type}")
                         except Exception:
                             pass
                     # Hapus UNIQUE constraint lama di item_code jika ada
@@ -157,8 +172,11 @@ class DatabaseManager:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         sku_code TEXT NOT NULL,
                         product_name TEXT,
+                        resi_number TEXT,
+                        courier TEXT,
                         status TEXT DEFAULT 'PENDING',
                         reason TEXT,
+                        user_id INTEGER,
                         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -198,6 +216,9 @@ class DatabaseManager:
                     "ALTER TABLE trackings ADD COLUMN destination TEXT",
                     "ALTER TABLE trackings ADD COLUMN user_id INTEGER",
                     "ALTER TABLE trackings ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+                    "ALTER TABLE returns ADD COLUMN resi_number TEXT",
+                    "ALTER TABLE returns ADD COLUMN courier TEXT",
+                    "ALTER TABLE returns ADD COLUMN user_id INTEGER",
                 ]:
                     try:
                         conn.execute(col_def)
@@ -498,44 +519,56 @@ class DatabaseManager:
 
     # ─── RETURN METHODS ──────────────────────────────────────────────────────────
 
-    def get_returns(self):
+    def get_returns(self, user_id=None):
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                    cur.execute("SELECT * FROM returns ORDER BY created_at DESC")
+                    if user_id:
+                        cur.execute("SELECT * FROM returns WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
+                    else:
+                        cur.execute("SELECT * FROM returns ORDER BY created_at DESC")
                     return [dict(row) for row in cur.fetchall()]
         else:
             with self.get_connection() as conn:
-                cursor = conn.execute("SELECT * FROM returns ORDER BY created_at DESC")
+                if user_id:
+                    cursor = conn.execute("SELECT * FROM returns WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+                else:
+                    cursor = conn.execute("SELECT * FROM returns ORDER BY created_at DESC")
                 return [dict(row) for row in cursor.fetchall()]
 
-    def add_return(self, sku_code, product_name, reason, status='PENDING'):
+    def add_return(self, sku_code, product_name, reason, resi_number=None, courier=None, user_id=None, status='PENDING'):
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute("""
-                        INSERT INTO returns (sku_code, product_name, reason, status)
-                        VALUES (%s, %s, %s, %s)
-                    """, (sku_code, product_name, reason, status))
+                        INSERT INTO returns (sku_code, product_name, reason, resi_number, courier, user_id, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """, (sku_code, product_name, reason, resi_number, courier, user_id, status))
                 conn.commit()
         else:
             with self.get_connection() as conn:
                 conn.execute("""
-                    INSERT INTO returns (sku_code, product_name, reason, status)
-                    VALUES (?, ?, ?, ?)
-                """, (sku_code, product_name, reason, status))
+                    INSERT INTO returns (sku_code, product_name, reason, resi_number, courier, user_id, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (sku_code, product_name, reason, resi_number, courier, user_id, status))
                 conn.commit()
 
-    def return_exists(self, sku_code):
-        """Cek apakah sudah ada data retur untuk sku_code ini (hindari duplikat dari worker)."""
+    def return_exists(self, sku_code, user_id=None):
+        """Cek apakah sudah ada data retur untuk sku_code ini per user."""
         if self.use_postgres:
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) FROM returns WHERE sku_code = %s", (sku_code,))
+                    if user_id:
+                        cur.execute("SELECT COUNT(*) FROM returns WHERE sku_code = %s AND user_id = %s", (sku_code, user_id))
+                    else:
+                        cur.execute("SELECT COUNT(*) FROM returns WHERE sku_code = %s", (sku_code,))
                     return cur.fetchone()[0] > 0
         else:
             with self.get_connection() as conn:
-                cursor = conn.execute("SELECT COUNT(*) FROM returns WHERE sku_code = ?", (sku_code,))
+                if user_id:
+                    cursor = conn.execute("SELECT COUNT(*) FROM returns WHERE sku_code = ? AND user_id = ?", (sku_code, user_id))
+                else:
+                    cursor = conn.execute("SELECT COUNT(*) FROM returns WHERE sku_code = ?", (sku_code,))
                 return cursor.fetchone()[0] > 0
 
     # ─── CANCELLATION METHODS ────────────────────────────────────────────────────

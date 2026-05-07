@@ -91,6 +91,8 @@ class ShipmentRegister(BaseModel):
 class ReturnCreate(BaseModel):
     sku_code: str
     product_name: Optional[str] = None
+    resi_number: Optional[str] = None
+    courier: Optional[str] = None
     reason: Optional[str] = None
     status: Optional[str] = "PENDING"
 
@@ -155,9 +157,17 @@ async def auto_update_worker():
                             raw_desc = h.get("description") or h.get("status") or ""
                         reason = f"{reason_type}: {raw_desc}" if raw_desc else reason_type
 
-                        if not db.return_exists(item_code):
-                            db.add_return(item_code, item_code, reason, "PENDING")
-                            print(f"[Worker] {item_code} -> {reason_type} dicatat ke tabel returns")
+                        if not db.return_exists(item_code, user_id=user_id):
+                            db.add_return(
+                                sku_code=item_code, 
+                                product_name=item_code, 
+                                reason=reason, 
+                                resi_number=resi, 
+                                courier=courier, 
+                                user_id=user_id,
+                                status="PENDING"
+                            )
+                            print(f"[Worker] {item_code} -> {reason_type} dicatat ke tabel returns (User: {user_id})")
 
                     # --- Deteksi otomatis pembatalan ---
                     if is_cancelled:
@@ -364,21 +374,52 @@ async def track_direct(
 # ─── RETURN ENDPOINTS ─────────────────────────────────────────────────────────
 
 @app.get("/returns")
-async def list_returns():
-    """Ambil semua data retur."""
-    return db.get_returns()
+async def list_returns(current_user: dict = Depends(get_current_user)):
+    """Ambil semua data retur milik user yang sedang login."""
+    user_id = current_user["user_id"]
+    return db.get_returns(user_id=user_id)
 
 @app.post("/returns")
-async def create_return(data: ReturnCreate):
+async def create_return(data: ReturnCreate, current_user: dict = Depends(get_current_user)):
     """
     Simpan data retur baru.
-    Jika sku_code sudah ada (duplikat), tidak insert ulang.
+    Jika sku_code sudah ada untuk user ini (duplikat), tidak insert ulang.
     """
-    if db.return_exists(data.sku_code):
+    user_id = current_user["user_id"]
+    if db.return_exists(data.sku_code, user_id=user_id):
         return {"success": False, "message": f"Retur untuk {data.sku_code} sudah ada"}
     try:
-        db.add_return(data.sku_code, data.product_name, data.reason, data.status or "PENDING")
+        db.add_return(
+            sku_code=data.sku_code, 
+            product_name=data.product_name, 
+            reason=data.reason, 
+            resi_number=data.resi_number, 
+            courier=data.courier, 
+            user_id=user_id,
+            status=data.status or "PENDING"
+        )
         return {"success": True, "message": f"Retur {data.sku_code} berhasil dicatat"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/returns/{sku_code}")
+async def delete_return(
+    sku_code: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Hapus catatan retur berdasarkan sku_code."""
+    user_id = current_user["user_id"]
+    try:
+        if db.use_postgres:
+            with db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM returns WHERE sku_code = %s AND user_id = %s", (sku_code, user_id))
+                conn.commit()
+        else:
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM returns WHERE sku_code = ? AND user_id = ?", (sku_code, user_id))
+                conn.commit()
+        return {"success": True, "message": f"Catatan retur {sku_code} dihapus"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
